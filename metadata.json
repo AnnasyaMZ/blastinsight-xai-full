@@ -1,0 +1,6 @@
+{
+  "name": "BlastInsight-XAI",
+  "description": "Sistem pendukung keputusan evaluasi fragmentasi peledakan tambang berbasis Explainable Computer Vision & Deep Learning YOLO11-Seg.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
