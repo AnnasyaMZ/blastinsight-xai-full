@@ -383,7 +383,7 @@ export default function App() {
                     itemStyle={{color: '#FF7300'}}
                   />
                   <Bar dataKey="map" name="Mask mAP50-95" radius={[4, 4, 0, 0]}>
-                    {modelProgressData.map((entry, index) => (
+                    {modelProgressData.map((_, index) => (
                       <Cell key={`cell-${index}`} fill={index === 3 ? '#FF7300' : '#333333'} className="hover:opacity-80 transition-opacity cursor-pointer" />
                     ))}
                   </Bar>
