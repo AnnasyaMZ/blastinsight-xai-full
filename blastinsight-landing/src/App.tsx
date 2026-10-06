@@ -178,7 +178,7 @@ export default function App() {
           </div>
           
           <div className="relative h-[500px] w-full bg-card/50 rounded-xl border border-border/80 p-2 shadow-[0_0_40px_rgba(255,115,0,0.05)] backdrop-blur-sm group overflow-hidden">
-            <div className="absolute inset-2 rounded-lg bg-[url('https://images.unsplash.com/photo-1518709268805-4e9042af9f23?q=80&w=1200&auto=format&fit=crop')] bg-cover bg-center overflow-hidden transition-transform duration-700 group-hover:scale-105">
+           <div className="absolute inset-2 rounded-lg bg-[url('/10.bmp')] bg-cover bg-center overflow-hidden">
               <div className="absolute inset-0 bg-gradient-to-tr from-black/80 via-black/40 to-accent/20 mix-blend-multiply" />
               <div className="absolute inset-0 border border-border/30 rounded-lg" />
               
