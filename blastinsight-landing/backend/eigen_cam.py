@@ -20,7 +20,7 @@ MAX_RAW_DIM = 1600
 
 # Untuk Railway, EigenCAM dibuat lebih hemat RAM
 # Segmentasi utama tetap 960 di inference.py
-CAM_IMGSZ = 640
+CAM_IMGSZ = 320
 
 # Sesuai hasil eksperimen paper:
 # Layer 16 = P3
