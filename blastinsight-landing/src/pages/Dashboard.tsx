@@ -1,408 +1,770 @@
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { 
-  LayoutDashboard, 
-  History, 
-  Settings, 
-  LogOut, 
-  UploadCloud,
-  PlusCircle,
-  Activity, 
-  Layers, 
-  AlertTriangle, 
-  CheckCircle2, 
-  ChevronRight,
-  TrendingUp,
-  Image as ImageIcon,
-  Eye,
-  ScanSearch
-} from 'lucide-react';
-import { 
-  AreaChart, 
-  Area, 
-  XAxis, 
-  YAxis, 
-  CartesianGrid, 
-  ResponsiveContainer, 
-  Tooltip as RechartsTooltip 
-} from 'recharts';
+import { useCallback, useEffect, useState } from 'react';
+import type { ActiveNav, BlastRecord } from '../types';
+import { DEFAULT_BLAST, INITIAL_BLAST_HISTORY } from '../data/blastData';
+import { Sidebar } from '../components/Sidebar';
+import { AnalysisView } from '../components/AnalysisView';
+import { DashboardView } from '../components/DashboardView';
+import { HistoryView } from '../components/HistoryView';
+import { AboutView } from '../components/AboutView';
+import { supabase } from '../lib/supabaseClient';
 
-// --- INTERFACE & DUMMY DATA ---
-interface BlastRecord {
-  id: string;
-  blastId: string;
-  pitBench: string;
-  blastDate: string;
-  detectedFragments: number;
-  oversizePercentage: number;
-  oversizeCount: number;
-  percentiles: { p10: number; p50: number; p80: number };
-  evaluationStatus: string;
-}
+/*
+  IMPORTANT:
+  - Sesuaikan nama bucket ini jika bucket Supabase Storage milikmu berbeda.
+  - Bucket harus PUBLIC jika URL disimpan dengan getPublicUrl().
+*/
+const STORAGE_BUCKET = 'blast-analysis';
 
-const dummyHistory: BlastRecord[] = [
-  { id: '1', blastId: 'BLAST-2026-001', pitBench: 'Pit A (Batugamping)', blastDate: '10 Okt 2026', detectedFragments: 1245, oversizePercentage: 8.4, oversizeCount: 104, percentiles: { p10: 25, p50: 42, p80: 85 }, evaluationStatus: 'Optimal' },
-  { id: '2', blastId: 'BLAST-2026-002', pitBench: 'Pit B (Andesit Keras)', blastDate: '09 Okt 2026', detectedFragments: 980, oversizePercentage: 18.7, oversizeCount: 183, percentiles: { p10: 30, p50: 55, p80: 115 }, evaluationStatus: 'Perlu Evaluasi' },
-  { id: '3', blastId: 'BLAST-2026-003', pitBench: 'Pit C (Diorit Masif)', blastDate: '08 Okt 2026', detectedFragments: 1560, oversizePercentage: 28.5, oversizeCount: 444, percentiles: { p10: 45, p50: 85, p80: 150 }, evaluationStatus: 'Kritis' }
-];
+type DistributionPoint = {
+  diameter_px: number;
+  cumulative_area_percent: number;
+};
 
-const cumulativeData = [
-  { size: 0, percentage: 0 }, { size: 50, percentage: 5 }, { size: 100, percentage: 15 },
-  { size: 150, percentage: 40 }, { size: 200, percentage: 65 }, { size: 250, percentage: 85 },
-  { size: 300, percentage: 95 }, { size: 350, percentage: 100 },
-];
+type ExtendedBlastRecord = BlastRecord & {
+  segmentationImageBase64?: string;
+  eigenCamImageBase64?: string;
+
+  distributionCurve?: DistributionPoint[];
+
+  totalDetections?: number;
+  excludedFragments?: number;
+  validPercentage?: number;
+
+  qc?: {
+    confidence_threshold?: number;
+    edge_touching_excluded?: number;
+    low_confidence_excluded?: number;
+  };
+
+  targetD50?: {
+    lower: number;
+    upper: number;
+  };
+};
+
+const toNumberOrZero = (value: unknown) => {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+};
+
+const toNumberOrUndefined = (value: unknown) => {
+  if (value === null || value === undefined || value === '') {
+    return undefined;
+  }
+
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
+};
+
+const sanitizeFilePart = (value: string) =>
+  value
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'blast';
+
+const extensionFromMime = (mime: string) => {
+  if (mime.includes('png')) return 'png';
+  if (mime.includes('webp')) return 'webp';
+  return 'jpg';
+};
+
+const isSupabaseStorageUrl = (value?: string) =>
+  Boolean(
+    value &&
+      value.startsWith('http') &&
+      value.includes('/storage/v1/object/')
+  );
+
+/*
+  Menyimpan source gambar blob:/data: ke Supabase Storage.
+  Jika source sudah berupa URL Supabase Storage, URL lama dipakai kembali.
+*/
+const persistImageToStorage = async (
+  source: string | undefined,
+  blastId: string,
+  variant: 'original' | 'segmentation' | 'eigencam'
+) => {
+  if (!source) return null;
+
+  if (isSupabaseStorageUrl(source)) {
+    return source;
+  }
+
+  /*
+    URL eksternal lama (mis. Unsplash) tidak dipaksa di-upload ulang.
+    Untuk analisis baru, original biasanya blob: dan output AI berupa data:.
+  */
+  if (
+    source.startsWith('http') &&
+    !source.startsWith('blob:') &&
+    !source.startsWith('data:')
+  ) {
+    return source;
+  }
+
+  const response = await fetch(source);
+
+  if (!response.ok) {
+    throw new Error(`Gagal membaca gambar ${variant}.`);
+  }
+
+  const blob = await response.blob();
+  const extension = extensionFromMime(blob.type || 'image/jpeg');
+  const safeBlastId = sanitizeFilePart(blastId);
+  const stamp = Date.now();
+
+  const path =
+    `${safeBlastId}/${stamp}/${variant}.${extension}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .upload(path, blob, {
+      contentType: blob.type || 'image/jpeg',
+      cacheControl: '3600',
+      upsert: true
+    });
+
+  if (uploadError) {
+    throw new Error(
+      `Upload ${variant} ke Supabase Storage gagal: ${uploadError.message}`
+    );
+  }
+
+  const { data } = supabase.storage
+    .from(STORAGE_BUCKET)
+    .getPublicUrl(path);
+
+  return data.publicUrl;
+};
+
+/*
+  Status DSS:
+  1. Prioritas pertama: status yang sudah dihasilkan FastAPI.
+  2. Fallback hanya jika row lama belum punya evaluation_status tetapi
+     D50 + target bawah/atas tersedia.
+  3. TIDAK PERNAH memakai oversize_percentage.
+*/
+const resolveEvaluationStatus = (
+  storedStatus: unknown,
+  d50: number,
+  lower?: number,
+  upper?: number
+) => {
+  const normalized = String(storedStatus ?? '').toUpperCase();
+
+  if (
+    normalized === 'OPTIMAL' ||
+    normalized === 'OVERSIZE' ||
+    normalized === 'OVER-BREAKING' ||
+    normalized === 'NEEDS_TARGET' ||
+    normalized === 'UNAVAILABLE'
+  ) {
+    return normalized;
+  }
+
+  if (
+    d50 > 0 &&
+    lower !== undefined &&
+    upper !== undefined &&
+    lower < upper
+  ) {
+    if (d50 > upper) return 'OVERSIZE';
+    if (d50 < lower) return 'OVER-BREAKING';
+    return 'OPTIMAL';
+  }
+
+  return 'UNAVAILABLE';
+};
 
 export default function Dashboard() {
-  const navigate = useNavigate();
-  // State untuk berpindah antara 'overview' (Telemetri) dan 'analysis' (XAI)
-  const [activeMenu, setActiveMenu] = useState('overview');
-  const [historyData] = useState<BlastRecord[]>(dummyHistory);
+  const [activeNav, setActiveNav] =
+    useState<ActiveNav>('dashboard');
 
-  const handleLogout = () => navigate('/');
-  const handleGoToAnalysis = () => setActiveMenu('analysis');
+  const [currentBlast, setCurrentBlast] =
+    useState<BlastRecord>(DEFAULT_BLAST);
 
-  // Kalkulasi KPI
-  const totalBlasts = historyData.length + 18; 
-  const avgP50 = (historyData.reduce((acc, b) => acc + b.percentiles.p50, 0) / historyData.length).toFixed(1);
-  const totalBoulders = historyData.reduce((acc, b) => acc + b.oversizeCount, 0);
+  /*
+    History dimulai KOSONG.
+    Jangan lagi menjadikan INITIAL_BLAST_HISTORY sebagai data dashboard,
+    supaya KPI tidak bercampur dengan data demo.
+  */
+  const [history, setHistory] =
+    useState<BlastRecord[]>([]);
+
+  const [isMobileMenuOpen, setIsMobileMenuOpen] =
+    useState(false);
+
+  const [historyBlastToOpen, setHistoryBlastToOpen] =
+    useState<BlastRecord | null>(null);
+
+  const mapRowToBlastRecord = useCallback(
+    (row: any): BlastRecord => {
+      const id = String(row.id);
+
+      const d10 = toNumberOrZero(row.d10_score);
+      const d50 = toNumberOrZero(row.d50_score);
+      const d80 = toNumberOrZero(row.d80_score);
+
+      const targetLower =
+        toNumberOrUndefined(row.target_d50_lower);
+
+      const targetUpper =
+        toNumberOrUndefined(row.target_d50_upper);
+
+      const evaluationStatus = resolveEvaluationStatus(
+        row.evaluation_status,
+        d50,
+        targetLower,
+        targetUpper
+      );
+
+      const extendedRecord: ExtendedBlastRecord = {
+        ...DEFAULT_BLAST,
+
+        id,
+
+        blastId:
+          row.blast_id ||
+          `BLAST-${id.slice(0, 4).toUpperCase()}`,
+
+        pitBench:
+          row.location ||
+          'Area Tidak Diketahui',
+
+        blastDate:
+          row.blast_date ||
+          row.created_at,
+
+        geologyFormation:
+          row.geology_formation ||
+          DEFAULT_BLAST.geologyFormation,
+
+        fileName:
+          row.file_name ||
+          'Citra fragmentasi',
+
+        /*
+          URL ini sekarang harus URL permanen Supabase Storage.
+          Blob URL lama tetap bisa terbaca dari DB, tetapi setelah reload
+          memang tidak valid. Record lama sebaiknya dianalisis/simpan ulang.
+        */
+        imageUrl:
+          row.original_image_url ||
+          '',
+
+        detectedFragments:
+          toNumberOrZero(
+            row.valid_fragments ??
+            row.detected_fragments
+          ),
+
+        /*
+          Legacy field dipertahankan hanya agar shape BlastRecord lama
+          tidak rusak. TIDAK dipakai untuk DSS.
+        */
+        oversizePercentage:
+          toNumberOrZero(row.oversize_percentage),
+
+        evaluationStatus:
+          evaluationStatus as BlastRecord['evaluationStatus'],
+
+        statusDetail:
+          row.status_detail ||
+          (
+            evaluationStatus === 'NEEDS_TARGET'
+              ? 'Target D50 belum ditentukan.'
+              : evaluationStatus === 'UNAVAILABLE'
+                ? 'Evaluasi DSS belum tersedia.'
+                : `Hasil Evaluasi D50: ${d50.toFixed(2)} px`
+          ),
+
+        recommendationQuote:
+          row.ai_recommendation ||
+          'Belum tersedia rekomendasi.',
+
+        actionPoints:
+          Array.isArray(row.action_points)
+            ? row.action_points
+            : [],
+
+        percentiles: {
+          ...DEFAULT_BLAST.percentiles,
+          p10: d10,
+          p50: d50,
+          p80: d80
+        },
+
+        createdAt:
+          row.created_at,
+
+        segmentationImageBase64:
+          row.mask_image_url ||
+          undefined,
+
+        eigenCamImageBase64:
+          row.eigencam_image_url ||
+          undefined,
+
+        distributionCurve:
+          Array.isArray(row.distribution_curve)
+            ? row.distribution_curve
+            : [],
+
+        totalDetections:
+          toNumberOrUndefined(
+            row.total_detections
+          ),
+
+        excludedFragments:
+          toNumberOrUndefined(
+            row.excluded_fragments
+          ),
+
+        validPercentage:
+          toNumberOrUndefined(
+            row.valid_percentage
+          ),
+
+        qc: {
+          confidence_threshold:
+            toNumberOrUndefined(
+              row.qc_confidence_threshold
+            ) ?? 0.40,
+
+          edge_touching_excluded:
+            toNumberOrUndefined(
+              row.edge_touching_excluded
+            ),
+
+          low_confidence_excluded:
+            toNumberOrUndefined(
+              row.low_confidence_excluded
+            )
+        },
+
+        targetD50:
+          targetLower !== undefined &&
+          targetUpper !== undefined
+            ? {
+                lower: targetLower,
+                upper: targetUpper
+              }
+            : undefined
+      };
+
+      return extendedRecord;
+    },
+    []
+  );
+
+  const fetchHistoryFromDB =
+    useCallback(async () => {
+      const { data, error } = await supabase
+        .from('blast_records')
+        .select('*')
+        .order('created_at', {
+          ascending: false
+        });
+
+      if (error) {
+        console.error(
+          'Gagal mengambil history Supabase:',
+          error
+        );
+        return;
+      }
+
+      const mappedHistory =
+        (data ?? []).map(mapRowToBlastRecord);
+
+      setHistory(mappedHistory);
+    }, [mapRowToBlastRecord]);
+
+  useEffect(() => {
+    fetchHistoryFromDB();
+
+    /*
+      Realtime Supabase:
+      Dashboard/history ikut refresh jika ada INSERT/UPDATE/DELETE.
+      Pastikan Realtime untuk table blast_records diaktifkan di Supabase
+      jika ingin update antar-tab/perangkat secara live.
+    */
+    const channel = supabase
+      .channel('blast-records-realtime')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'blast_records'
+        },
+        () => {
+          fetchHistoryFromDB();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [fetchHistoryFromDB]);
+
+  const handleSaveToHistory =
+    async (recordToSave: BlastRecord) => {
+      try {
+        const record =
+          recordToSave as ExtendedBlastRecord;
+
+        const p10 =
+          toNumberOrZero(
+            (record.percentiles as any)?.p10
+          );
+
+        const p50 =
+          toNumberOrZero(
+            record.percentiles?.p50
+          );
+
+        const p80 =
+          toNumberOrZero(
+            record.percentiles?.p80
+          );
+
+        const targetLower =
+          toNumberOrUndefined(
+            record.targetD50?.lower
+          );
+
+        const targetUpper =
+          toNumberOrUndefined(
+            record.targetD50?.upper
+          );
+
+        /*
+          Status dari FastAPI adalah source of truth.
+          Kalau status teknis belum tersedia tetapi target lengkap,
+          fallback dihitung dari D50 vs target.
+        */
+        const evaluationStatus =
+          resolveEvaluationStatus(
+            record.evaluationStatus,
+            p50,
+            targetLower,
+            targetUpper
+          );
+
+        /*
+          1. Simpan ketiga gambar terlebih dahulu.
+          - original: blob URL browser
+          - segmentation: data:image/... base64 dari FastAPI
+          - eigencam: data:image/... base64 dari FastAPI
+        */
+        const [
+          originalImageUrl,
+          segmentationImageUrl,
+          eigenCamImageUrl
+        ] = await Promise.all([
+          persistImageToStorage(
+            record.imageUrl,
+            record.blastId,
+            'original'
+          ),
+
+          persistImageToStorage(
+            record.segmentationImageBase64,
+            record.blastId,
+            'segmentation'
+          ),
+
+          persistImageToStorage(
+            record.eigenCamImageBase64,
+            record.blastId,
+            'eigencam'
+          )
+        ]);
+
+        /*
+          2. Simpan metadata/hasil numerik ke Postgres.
+          oversize_percentage TIDAK lagi digunakan sebagai basis DSS.
+        */
+        const payload = {
+          blast_id:
+            record.blastId,
+
+          location:
+            record.pitBench,
+
+          blast_date:
+            record.blastDate,
+
+          geology_formation:
+            record.geologyFormation,
+
+          file_name:
+            record.fileName,
+
+          d10_score:
+            p10,
+
+          d50_score:
+            p50,
+
+          d80_score:
+            p80,
+
+          valid_fragments:
+            Number(
+              record.detectedFragments ?? 0
+            ),
+
+          total_detections:
+            record.totalDetections ?? null,
+
+          excluded_fragments:
+            record.excludedFragments ?? null,
+
+          valid_percentage:
+            record.validPercentage ?? null,
+
+          qc_confidence_threshold:
+            record.qc?.confidence_threshold ?? 0.40,
+
+          edge_touching_excluded:
+            record.qc?.edge_touching_excluded ?? null,
+
+          low_confidence_excluded:
+            record.qc?.low_confidence_excluded ?? null,
+
+          target_d50_lower:
+            targetLower ?? null,
+
+          target_d50_upper:
+            targetUpper ?? null,
+
+          evaluation_status:
+            evaluationStatus,
+
+          status_detail:
+            record.statusDetail ?? null,
+
+          ai_recommendation:
+            record.recommendationQuote ?? null,
+
+          action_points:
+            record.actionPoints ?? [],
+
+          distribution_curve:
+            record.distributionCurve ?? [],
+
+          original_image_url:
+            originalImageUrl,
+
+          mask_image_url:
+            segmentationImageUrl,
+
+          eigencam_image_url:
+            eigenCamImageUrl
+        };
+
+        const {
+          data,
+          error
+        } = await supabase
+          .from('blast_records')
+          .insert([payload])
+          .select('*')
+          .single();
+
+        if (error) {
+          throw error;
+        }
+
+        /*
+          3. Gunakan row yang benar-benar tersimpan di DB
+          untuk memperbarui React state.
+        */
+        const savedRecord =
+          mapRowToBlastRecord(data);
+
+        setHistory((prev) => [
+          savedRecord,
+          ...prev.filter(
+            (item) =>
+              item.id !== savedRecord.id &&
+              item.blastId !== savedRecord.blastId
+          )
+        ]);
+
+        setCurrentBlast(savedRecord);
+
+        console.info(
+          'Analisis berhasil disimpan:',
+          savedRecord.blastId
+        );
+      } catch (error) {
+        console.error(
+          'Gagal menyimpan analisis:',
+          error
+        );
+
+        /*
+          Penting:
+          Jangan memasukkan record ke history secara optimistik ketika
+          upload/insert gagal, supaya UI tidak menampilkan data yang
+          sebenarnya belum permanen.
+        */
+        throw error;
+      }
+    };
+
+  const handleSelectPresetRecord =
+    (recordId: string) => {
+      /*
+        Preset demo tetap boleh berasal dari blastData,
+        tetapi tidak ikut dihitung sebagai history/dashboard
+        sampai user menyimpannya.
+      */
+      const found =
+        history.find(
+          (item) => item.id === recordId
+        ) ||
+        INITIAL_BLAST_HISTORY.find(
+          (item) => item.id === recordId
+        ) ||
+        DEFAULT_BLAST;
+
+      setCurrentBlast(found);
+    };
+
+  const handleOpenHistoryDetail =
+    (blast: BlastRecord) => {
+      setCurrentBlast(blast);
+      setHistoryBlastToOpen(blast);
+      setActiveNav('riwayat');
+    };
+
+  const handleHistoryModalOpened = () => {
+    setHistoryBlastToOpen(null);
+  };
 
   return (
-    <div className="flex h-screen bg-[#050505] text-text-main font-sans overflow-hidden selection:bg-accent selection:text-black relative">
-      
-      {/* CSS Keyframes (Langsung di-inject) */}
+    <div className="min-h-screen bg-black text-[#F8FAFC] font-sans flex selection:bg-[#FF7300] selection:text-black relative overflow-hidden">
       <style>{`
         @keyframes fadeSlideUp {
-          0% { opacity: 0; transform: translateY(15px); }
-          100% { opacity: 1; transform: translateY(0); }
+          0% {
+            opacity: 0;
+            transform: translateY(15px);
+          }
+
+          100% {
+            opacity: 1;
+            transform: translateY(0);
+          }
         }
-        .animate-fade-slide { animation: fadeSlideUp 0.4s ease-out forwards; }
+
+        .animate-fade-slide {
+          animation: fadeSlideUp .4s ease-out forwards;
+        }
       `}</style>
 
-      {/* Global Ambient Background Glow */}
-      <div className="absolute top-0 right-0 w-[600px] h-[600px] bg-accent/5 blur-[150px] rounded-full pointer-events-none mix-blend-screen" />
+      <div className="fixed top-[-10%] left-[-5%] w-[500px] h-[500px] bg-[#FF7300]/15 blur-[120px] rounded-full pointer-events-none z-0" />
 
-      {/* 1. SIDEBAR KIRI */}
-      <aside className="w-64 bg-black/90 border-r border-border/50 flex flex-col hidden md:flex z-50 backdrop-blur-xl">
-        <div className="h-20 flex items-center px-6 border-b border-border/50">
-          <img src="/logo.png" alt="BlastInsight" className="h-8 object-contain cursor-pointer hover:scale-105 transition-transform" onClick={() => navigate('/')} />
-        </div>
-        
-        <nav className="flex-1 py-6 px-4 space-y-2">
-          <button 
-            onClick={() => setActiveMenu('overview')}
-            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-bold transition-all duration-300 ${activeMenu === 'overview' ? 'bg-accent/10 text-accent border border-accent/30 shadow-[0_0_15px_rgba(255,115,0,0.1)]' : 'text-text-secondary hover:bg-card hover:text-white border border-transparent'}`}
+      <div className="fixed bottom-[-10%] right-[-5%] w-[400px] h-[400px] bg-[#22C55E]/10 blur-[120px] rounded-full pointer-events-none z-0" />
+
+      <Sidebar
+        activeNav={activeNav}
+        setActiveNav={setActiveNav}
+        isOpenMobile={isMobileMenuOpen}
+        onCloseMobile={() =>
+          setIsMobileMenuOpen(false)
+        }
+      />
+
+      <div className="lg:pl-72 flex flex-col flex-1 min-h-screen w-full min-w-0 relative z-10 transition-all duration-300">
+        <div className="lg:hidden flex items-center justify-between p-4 border-b border-[#222] bg-black/80 backdrop-blur-md sticky top-0 z-40">
+          <div className="flex items-center gap-3">
+            <img
+              src="/logo.png"
+              alt="BlastInsight-XAI"
+              className="h-7 w-auto object-contain"
+            />
+
+            <span className="font-bold text-[14px]">
+              BlastInsight-XAI
+            </span>
+          </div>
+
+          <button
+            onClick={() =>
+              setIsMobileMenuOpen(true)
+            }
+            className="p-1.5 rounded-lg text-[#A3A3A3] hover:text-white hover:bg-[#111] border border-[#222] transition-colors"
           >
-            <LayoutDashboard size={18} /> Telemetri
-          </button>
-          <button 
-            onClick={() => setActiveMenu('analysis')}
-            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-bold transition-all duration-300 ${activeMenu === 'analysis' ? 'bg-accent/10 text-accent border border-accent/30 shadow-[0_0_15px_rgba(255,115,0,0.1)]' : 'text-text-secondary hover:bg-card hover:text-white border border-transparent'}`}
-          >
-            <ScanSearch size={18} /> Ruang Analisis XAI
-          </button>
-          <button className="w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-bold text-text-secondary hover:bg-card hover:text-white transition-all border border-transparent">
-            <Settings size={18} /> Pengaturan Model
-          </button>
-        </nav>
-
-        <div className="p-4 border-t border-border/50">
-          <button onClick={handleLogout} className="w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-bold text-danger/80 hover:bg-danger/10 hover:text-danger transition-all">
-            <LogOut size={18} /> Keluar
+            <span className="material-symbols-outlined text-[20px]">
+              menu
+            </span>
           </button>
         </div>
-      </aside>
 
-      {/* 2. AREA KONTEN UTAMA */}
-      <main className="flex-1 flex flex-col h-screen overflow-y-auto relative z-10">
-        
-        {/* HEADER KONTEN */}
-        <header className="h-20 flex items-center justify-between px-8 border-b border-border/30 bg-black/40 backdrop-blur-md sticky top-0 z-40">
-          <div>
-            <h1 className="text-lg font-bold text-white tracking-wide">
-              {activeMenu === 'overview' ? 'Dashboard Telemetri' : 'Ruang Analisis Fragmentasi'}
-            </h1>
-            <p className="text-[11px] text-accent uppercase tracking-wider font-bold">DBEST 2026 Evaluation System</p>
-          </div>
-          <div className="flex items-center gap-4">
-            <button onClick={handleGoToAnalysis} className="flex items-center gap-2 bg-card border border-border px-4 py-2 rounded-lg text-sm font-bold hover:border-accent/50 hover:text-accent transition-colors">
-              <UploadCloud size={16} /> Upload Foto Baru
-            </button>
-            <div className="h-10 w-10 rounded-full bg-accent/20 border border-accent/50 flex items-center justify-center text-accent font-bold cursor-pointer hover:bg-accent/30 transition-colors shadow-[0_0_15px_rgba(255,115,0,0.2)]">
-              AM
-            </div>
-          </div>
-        </header>
+        <main className="w-full flex-1 bg-transparent">
+          {activeNav === 'dashboard' && (
+            <DashboardView
+              history={history}
+              onSelectBlast={
+                handleOpenHistoryDetail
+              }
+              onGoToAnalysis={() =>
+                setActiveNav(
+                  'analisis-baru'
+                )
+              }
+            />
+          )}
 
-        {/* ================= VIEW 1: TELEMETRI (OVERVIEW) ================= */}
-        {activeMenu === 'overview' && (
-          <div className="p-8 max-w-7xl mx-auto w-full flex flex-col gap-8 animate-fade-slide">
-            
-            <div className="flex flex-col md:flex-row md:items-end justify-between gap-6 pb-6 border-b border-border/50">
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center gap-2 text-accent text-xs uppercase tracking-widest font-bold">
-                  <span className="relative flex h-2 w-2">
-                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-accent opacity-75"></span>
-                    <span className="relative inline-flex rounded-full h-2 w-2 bg-accent"></span>
-                  </span>
-                  Monitoring Operasional Penambangan
-                </div>
-                <h2 className="text-3xl md:text-4xl font-bold bg-gradient-to-r from-white to-text-secondary bg-clip-text text-transparent tracking-tight">
-                  Status Eksekusi Peledakan
-                </h2>
-                <p className="text-sm text-text-secondary max-w-xl">Ringkasan metrik fragmentasi batuan, efisiensi penggalian, dan mitigasi oversize boulder di seluruh pit aktif.</p>
-              </div>
-              <button onClick={handleGoToAnalysis} className="px-6 py-3 rounded-lg bg-gradient-to-r from-accent to-[#E66800] text-black font-bold text-sm hover:shadow-[0_0_20px_rgba(255,115,0,0.4)] hover:-translate-y-0.5 active:scale-95 transition-all duration-300 flex items-center gap-2 group self-start md:self-auto">
-                <PlusCircle size={18} className="transition-transform group-hover:rotate-90" />
-                <span>Analisis Foto Baru</span>
-              </button>
-            </div>
+          {activeNav ===
+            'analisis-baru' && (
+            <AnalysisView
+              currentBlast={
+                currentBlast
+              }
+              setCurrentBlast={
+                setCurrentBlast
+              }
+              onSaveToHistory={
+                handleSaveToHistory
+              }
+              onSelectPresetRecord={
+                handleSelectPresetRecord
+              }
+            />
+          )}
 
-            {/* KPI Cards */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              <div className="bg-card/40 backdrop-blur-md rounded-xl border border-border/80 p-5 flex flex-col justify-between hover:border-accent/40 transition-colors group cursor-default shadow-lg">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs uppercase tracking-wider text-text-secondary font-bold">Total Peledakan</span>
-                  <Activity size={16} className="text-accent opacity-50 group-hover:opacity-100 transition-opacity" />
-                </div>
-                <div className="flex items-baseline gap-2 my-2">
-                  <span className="text-3xl font-bold text-white">{totalBlasts}</span>
-                  <span className="text-xs font-medium text-green-500">Bulan Ini</span>
-                </div>
-                <span className="text-xs text-text-secondary">Cakupan: Pit A, Pit B, Pit C</span>
-              </div>
-              
-              <div className="bg-card/40 backdrop-blur-md rounded-xl border border-border/80 p-5 flex flex-col justify-between hover:border-blue-500/40 transition-colors group cursor-default shadow-lg">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs uppercase tracking-wider text-text-secondary font-bold">Rata-rata P50</span>
-                  <TrendingUp size={16} className="text-blue-500 opacity-50 group-hover:opacity-100 transition-opacity" />
-                </div>
-                <div className="flex items-baseline gap-2 my-2">
-                  <span className="text-3xl font-bold text-white">{avgP50}</span>
-                  <span className="text-sm font-medium text-text-secondary">cm</span>
-                </div>
-                <span className="text-xs text-blue-400 font-medium">Dalam batas toleransi desain</span>
-              </div>
+          {activeNav === 'riwayat' && (
+            <HistoryView
+              history={history}
+              onSelectBlast={
+                setCurrentBlast
+              }
+              onGoToAnalysis={() =>
+                setActiveNav(
+                  'analisis-baru'
+                )
+              }
+              initialSelectedBlast={
+                historyBlastToOpen
+              }
+              onInitialSelectedBlastHandled={
+                handleHistoryModalOpened
+              }
+            />
+          )}
 
-              <div className="bg-card/40 backdrop-blur-md rounded-xl border border-border/80 p-5 flex flex-col justify-between hover:border-danger/40 transition-colors group cursor-default shadow-lg">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs uppercase tracking-wider text-text-secondary font-bold">Boulder Terdeteksi</span>
-                  <AlertTriangle size={16} className="text-danger opacity-50 group-hover:opacity-100 transition-opacity" />
-                </div>
-                <div className="flex items-baseline gap-2 my-2">
-                  <span className="text-3xl font-bold text-danger">{totalBoulders}</span>
-                  <span className="text-xs font-medium text-text-secondary">partikel &gt;100 cm</span>
-                </div>
-                <span className="text-xs text-accent font-medium">Disposisi secondary breaking</span>
-              </div>
-
-              <div className="bg-card/40 backdrop-blur-md rounded-xl border border-border/80 p-5 flex flex-col justify-between hover:border-green-500/40 transition-colors group cursor-default shadow-lg">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs uppercase tracking-wider text-text-secondary font-bold">Crusher Uptime</span>
-                  <CheckCircle2 size={16} className="text-green-500 opacity-50 group-hover:opacity-100 transition-opacity" />
-                </div>
-                <div className="flex items-baseline gap-2 my-2">
-                  <span className="text-3xl font-bold text-green-500">98.4%</span>
-                  <span className="text-xs font-medium text-text-secondary">Indeks</span>
-                </div>
-                <span className="text-xs text-text-secondary">Zero bridging incidence (24h)</span>
-              </div>
-            </div>
-
-            {/* Active Pits */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="bg-black/60 border border-border/80 rounded-xl p-5 flex flex-col gap-4 hover:border-green-500/30 transition-colors shadow-lg">
-                <div className="flex items-center justify-between border-b border-border/50 pb-3">
-                  <span className="font-bold text-sm text-white flex items-center gap-2"><Layers size={14} className="text-text-secondary"/> Pit A (Batugamping)</span>
-                  <span className="px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider bg-green-500/10 text-green-500 border border-green-500/20">Optimal</span>
-                </div>
-                <div className="text-xs text-text-secondary space-y-2.5">
-                  <div className="flex justify-between"><span className="text-muted">Oversize Rate:</span><span className="font-bold text-white">8.4%</span></div>
-                  <div className="flex justify-between"><span className="text-muted">Powder Factor:</span><span className="font-bold text-white">0.42 kg/m³</span></div>
-                  <div className="flex justify-between"><span className="text-muted">Excavator Fleet:</span><span className="font-medium text-white bg-card px-2 py-0.5 rounded border border-border">CAT 6020B</span></div>
-                </div>
-              </div>
-              
-              <div className="bg-black/60 border border-accent/30 rounded-xl p-5 flex flex-col gap-4 hover:border-accent/60 transition-colors shadow-[0_0_15px_rgba(255,115,0,0.05)]">
-                <div className="flex items-center justify-between border-b border-border/50 pb-3">
-                  <span className="font-bold text-sm text-white flex items-center gap-2"><Layers size={14} className="text-text-secondary"/> Pit B (Andesit Keras)</span>
-                  <span className="px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider bg-accent/15 text-accent border border-accent/30">Perlu Evaluasi</span>
-                </div>
-                <div className="text-xs text-text-secondary space-y-2.5">
-                  <div className="flex justify-between"><span className="text-muted">Oversize Rate:</span><span className="font-bold text-accent">18.7%</span></div>
-                  <div className="flex justify-between"><span className="text-muted">Powder Factor:</span><span className="font-bold text-white">0.48 kg/m³</span></div>
-                  <div className="flex justify-between"><span className="text-muted">Excavator Fleet:</span><span className="font-medium text-white bg-card px-2 py-0.5 rounded border border-border">Komatsu PC1250</span></div>
-                </div>
-              </div>
-
-              <div className="bg-black/60 border border-border/80 rounded-xl p-5 flex flex-col gap-4 hover:border-danger/40 transition-colors shadow-lg">
-                <div className="flex items-center justify-between border-b border-border/50 pb-3">
-                  <span className="font-bold text-sm text-white flex items-center gap-2"><Layers size={14} className="text-text-secondary"/> Pit C (Diorit Masif)</span>
-                  <span className="px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider bg-danger/10 text-danger border border-danger/30">Kritis</span>
-                </div>
-                <div className="text-xs text-text-secondary space-y-2.5">
-                  <div className="flex justify-between"><span className="text-muted">Oversize Rate:</span><span className="font-bold text-danger">28.5%</span></div>
-                  <div className="flex justify-between"><span className="text-muted">Powder Factor:</span><span className="font-bold text-white">0.38 kg/m³</span></div>
-                  <div className="flex justify-between"><span className="text-muted">Excavator Fleet:</span><span className="font-medium text-white bg-card px-2 py-0.5 rounded border border-border">Hitachi EX1200</span></div>
-                </div>
-              </div>
-            </div>
-
-            {/* Riwayat Table */}
-            <div className="bg-card/40 backdrop-blur-md rounded-xl border border-border/80 p-6 flex flex-col gap-6 shadow-xl hover:border-accent/30 transition-colors duration-500">
-              <div className="flex items-center justify-between">
-                <span className="font-bold text-lg text-white">Riwayat Peledakan Terbaru</span>
-                <span className="text-[10px] text-text-secondary uppercase tracking-wider font-bold bg-black/50 px-3 py-1.5 rounded-full border border-border/50">Klik baris untuk analisis</span>
-              </div>
-              <div className="overflow-x-auto rounded-lg border border-border/50">
-                <table className="w-full text-left text-sm whitespace-nowrap">
-                  <thead className="bg-black/80">
-                    <tr className="text-text-secondary uppercase text-[10px] font-bold tracking-wider">
-                      <th className="py-4 px-4 border-b border-border/50">Blast ID</th>
-                      <th className="py-4 px-4 border-b border-border/50">Lokasi Pit</th>
-                      <th className="py-4 px-4 border-b border-border/50">Tanggal</th>
-                      <th className="py-4 px-4 border-b border-border/50">Fragmen</th>
-                      <th className="py-4 px-4 border-b border-border/50">Oversize</th>
-                      <th className="py-4 px-4 border-b border-border/50">P50</th>
-                      <th className="py-4 px-4 border-b border-border/50">Status</th>
-                      <th className="py-4 px-4 border-b border-border/50 text-right">Aksi</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-border/50 bg-black/30">
-                    {historyData.map((item) => (
-                      <tr key={item.id} onClick={handleGoToAnalysis} className="hover:bg-accent/10 cursor-pointer transition-colors duration-300 group">
-                        <td className="py-4 px-4 font-bold text-white group-hover:text-accent transition-colors">{item.blastId}</td>
-                        <td className="py-4 px-4 text-text-secondary font-medium">{item.pitBench}</td>
-                        <td className="py-4 px-4 text-muted text-xs">{item.blastDate}</td>
-                        <td className="py-4 px-4 text-text-secondary tabular-nums">{item.detectedFragments} partikel</td>
-                        <td className="py-4 px-4 tabular-nums font-bold">
-                          <span className={item.oversizePercentage > 15 ? 'text-accent' : 'text-green-500'}>{item.oversizePercentage}%</span>
-                        </td>
-                        <td className="py-4 px-4 text-white tabular-nums">{item.percentiles.p50} cm</td>
-                        <td className="py-4 px-4">
-                          <span className={`px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider ${item.evaluationStatus === 'Optimal' ? 'bg-green-500/10 text-green-500 border border-green-500/20' : item.evaluationStatus === 'Perlu Evaluasi' ? 'bg-accent/10 text-accent border border-accent/20' : 'bg-danger/10 text-danger border border-danger/20'}`}>
-                            {item.evaluationStatus}
-                          </span>
-                        </td>
-                        <td className="py-4 px-4 text-right">
-                          <button className="text-text-secondary group-hover:text-accent font-bold text-xs flex items-center gap-1 justify-end w-full transition-colors">
-                            Buka <ChevronRight size={14} className="group-hover:translate-x-1 transition-transform" />
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-          </div>
-        )}
-
-        {/* ================= VIEW 2: RUANG ANALISIS XAI (ANALYSIS) ================= */}
-        {activeMenu === 'analysis' && (
-          <div className="p-8 max-w-7xl mx-auto w-full space-y-6 animate-fade-slide">
-            
-            {/* Action Bar */}
-            <div className="flex items-center justify-between bg-card/40 p-5 rounded-xl border border-border/80 backdrop-blur-md shadow-lg">
-               <div className="flex items-center gap-3">
-                 <div className="h-10 w-10 bg-accent/10 rounded-lg border border-accent/30 flex items-center justify-center">
-                   <ScanSearch size={20} className="text-accent" />
-                 </div>
-                 <div>
-                   <h3 className="text-white font-bold text-sm">Simulasi Proses Prediksi YOLO11</h3>
-                   <p className="text-xs text-text-secondary">Unggah foto muckpile untuk dianalisis oleh model XAI.</p>
-                 </div>
-               </div>
-               <button className="flex items-center gap-2 bg-black border border-border/80 px-4 py-2.5 rounded-lg text-sm font-bold text-white hover:border-accent/50 hover:text-accent transition-colors shadow-md">
-                <UploadCloud size={16} /> Upload Citra Mentah Baru
-              </button>
-            </div>
-
-            {/* Alert Banner */}
-            <div className="bg-accent/10 border border-accent/30 rounded-xl p-5 flex items-start gap-4 shadow-[0_0_15px_rgba(255,115,0,0.05)]">
-              <AlertTriangle className="text-accent shrink-0 mt-0.5" size={24} />
-              <div>
-                <h4 className="text-sm font-bold text-accent mb-1 uppercase tracking-wide">Indikasi: Distribusi Fragmentasi Relatif Kasar (Oversize)</h4>
-                <p className="text-sm text-text-secondary leading-relaxed">Berdasarkan inferensi model, persentase fragmen berukuran besar mendominasi area muckpile, mengindikasikan distribusi energi peledakan yang kurang optimal.</p>
-              </div>
-            </div>
-
-            {/* Panel Visualisasi 3 Kolom */}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              <div className="bg-card/40 border border-border/80 rounded-xl p-5 flex flex-col shadow-lg">
-                <div className="flex items-center gap-2 mb-4 text-sm font-bold text-white"><ImageIcon size={16} className="text-muted" /> Foto Input (Raw)</div>
-                <div className="flex-1 bg-black rounded-lg border border-border/50 overflow-hidden relative min-h-[250px]">
-                  <img src="https://images.unsplash.com/photo-1542382156828-59cbb147e8b2?q=80&w=600&auto=format&fit=crop" alt="Raw" className="w-full h-full object-cover opacity-80" />
-                </div>
-              </div>
-
-              <div className="bg-card/40 border border-accent/40 rounded-xl p-5 flex flex-col shadow-[0_0_20px_rgba(255,115,0,0.1)] relative overflow-hidden group">
-                <div className="absolute top-0 right-0 w-32 h-32 bg-accent/10 blur-[40px] pointer-events-none" />
-                <div className="flex items-center gap-2 mb-4 text-sm font-bold text-white relative z-10"><Layers size={16} className="text-accent" /> YOLO11-Seg (Instance)</div>
-                <div className="flex-1 bg-black rounded-lg border border-accent/30 overflow-hidden relative min-h-[250px] z-10">
-                   <img src="https://images.unsplash.com/photo-1542382156828-59cbb147e8b2?q=80&w=600&auto=format&fit=crop" alt="Seg" className="w-full h-full object-cover mix-blend-luminosity opacity-50" />
-                   <div className="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiPgo8cGF0aCBkPSJNMTAgMTBoNTB2NTBIMTB6IiBmaWxsPSJyZ2JhKDI1NSwgMTE1LCAwLCAwLjQpIiBzdHJva2U9IiNmZjczMDAiIHN0cm9rZS13aWR0aD0iMSIvPgo8L3N2Zz4=')] opacity-40 group-hover:opacity-60 transition-opacity" />
-                </div>
-              </div>
-
-              <div className="bg-card/40 border border-border/80 rounded-xl p-5 flex flex-col shadow-lg group">
-                <div className="flex items-center gap-2 mb-4 text-sm font-bold text-white"><Eye size={16} className="text-blue-500" /> EigenCAM Heatmap</div>
-                <div className="flex-1 bg-black rounded-lg border border-blue-500/30 overflow-hidden relative min-h-[250px]">
-                  <img src="https://images.unsplash.com/photo-1542382156828-59cbb147e8b2?q=80&w=600&auto=format&fit=crop" alt="CAM" className="w-full h-full object-cover" />
-                  <div className="absolute inset-0 bg-gradient-to-tr from-blue-600/60 via-transparent to-red-600/60 mix-blend-overlay group-hover:opacity-80 transition-opacity" />
-                </div>
-              </div>
-            </div>
-
-            {/* Panel Analitik & DSS */}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              <div className="lg:col-span-2 bg-card/40 border border-border/80 rounded-xl p-6 shadow-lg">
-                <h3 className="text-sm font-bold text-white mb-6">Kurva Distribusi Persentil Fragmentasi (S-Curve)</h3>
-                <div className="h-64 cursor-crosshair">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={cumulativeData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#222222" vertical={false} />
-                      <XAxis dataKey="size" stroke="#A3A3A3" fontSize={10} tickLine={false} axisLine={false} />
-                      <YAxis stroke="#A3A3A3" fontSize={10} tickLine={false} axisLine={false} />
-                      <RechartsTooltip contentStyle={{backgroundColor: '#0A0A0A', borderColor: '#222222', borderRadius: '8px', fontSize: '12px', color: '#FFF'}} />
-                      <Area type="monotone" dataKey="percentage" stroke="#FF7300" strokeWidth={2} fillOpacity={1} fill="url(#colorOrange)" />
-                      <defs>
-                        <linearGradient id="colorOrange" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="5%" stopColor="#FF7300" stopOpacity={0.4}/><stop offset="95%" stopColor="#FF7300" stopOpacity={0}/>
-                        </linearGradient>
-                      </defs>
-                    </AreaChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-
-              <div className="bg-card/40 border border-accent/40 rounded-xl p-6 shadow-[0_0_30px_rgba(255,115,0,0.1)] flex flex-col relative overflow-hidden">
-                <div className="absolute top-0 right-0 w-48 h-48 bg-accent/10 blur-[50px] pointer-events-none" />
-                <h3 className="text-sm font-bold text-white mb-6 relative z-10">Decision Support System</h3>
-                
-                <div className="flex gap-2 mb-8 relative z-10">
-                  <div className="flex-1 bg-black/60 p-3 rounded-lg border border-border/80 text-center"><div className="text-[10px] text-text-secondary uppercase font-bold mb-1">D10</div><div className="text-sm font-bold text-white tabular-nums">68 px</div></div>
-                  <div className="flex-1 bg-accent/15 p-3 rounded-lg border border-accent/50 text-center shadow-[0_0_15px_rgba(255,115,0,0.1)]"><div className="text-[10px] text-accent uppercase font-bold mb-1">D50 (Central)</div><div className="text-sm font-bold text-accent tabular-nums">142 px</div></div>
-                  <div className="flex-1 bg-black/60 p-3 rounded-lg border border-border/80 text-center"><div className="text-[10px] text-text-secondary uppercase font-bold mb-1">D80</div><div className="text-sm font-bold text-white tabular-nums">218 px</div></div>
-                </div>
-                
-                <div className="flex-1 relative z-10">
-                  <div className="text-xs font-bold text-text-secondary mb-3 uppercase tracking-widest border-b border-border/50 pb-2">Rekomendasi Tindakan</div>
-                  <ul className="space-y-4 text-sm text-text-main">
-                    <li className="flex items-start gap-3"><CheckCircle2 size={16} className="text-accent shrink-0 mt-0.5" /> <span>Kurangi jarak <strong>Burden & Spacing</strong> untuk meningkatkan distribusi energi.</span></li>
-                    <li className="flex items-start gap-3"><CheckCircle2 size={16} className="text-accent shrink-0 mt-0.5" /> <span>Tinjau ulang spesifikasi bahan peledak pada lubang basah.</span></li>
-                  </ul>
-                </div>
-                
-                <button className="w-full mt-6 py-3 bg-white/5 hover:bg-white/10 text-white text-sm font-bold rounded-lg border border-border/80 transition-all hover:border-accent/50 relative z-10">
-                  Unduh Laporan PDF
-                </button>
-              </div>
-            </div>
-
-          </div>
-        )}
-      </main>
+          {activeNav ===
+            'tentang-sistem' && (
+            <AboutView />
+          )}
+        </main>
+      </div>
     </div>
   );
 }
