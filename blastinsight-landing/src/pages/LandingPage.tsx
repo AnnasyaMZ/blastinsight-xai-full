@@ -155,7 +155,7 @@ export default function LandingPage() {
           <div className="relative h-[450px] w-full bg-[#111111] rounded-2xl border border-[#222222] p-2 shadow-[0_0_40px_rgba(255,115,0,0.1)] backdrop-blur-sm group overflow-hidden animate-fade-slide">
             <div 
               className="absolute inset-2 rounded-xl bg-cover bg-center transition-transform duration-700 group-hover:scale-105"
-              style={{ backgroundImage: `url('https://images.unsplash.com/photo-1542382156828-59cbb147e8b2?q=80&w=800&auto=format&fit=crop')` }}
+              style={{ backgroundImage: `url('/10.bmp')` }}
             >
               <div className="absolute inset-0 bg-black/40"></div>
               <div className="absolute top-0 right-0 w-64 h-64 bg-[#FF7300]/20 blur-[60px]"></div>
@@ -281,7 +281,7 @@ export default function LandingPage() {
             <div className="bg-[#111111] border border-[#222222] rounded-xl p-2 relative h-[400px] shadow-lg overflow-hidden group">
               <div 
                 className="absolute inset-2 rounded-lg bg-cover bg-center transition-transform duration-700 group-hover:scale-105"
-                style={{ backgroundImage: `url('https://images.unsplash.com/photo-1542382156828-59cbb147e8b2?q=80&w=800&auto=format&fit=crop')` }}
+                style={{ backgroundImage: `url('/eigencam.jpg')` }}
               >
                 <div className="absolute inset-0 bg-gradient-to-tr from-[#FF7300]/50 via-black/50 to-[#FF7300]/20 mix-blend-color-dodge opacity-90" />
                 <div className="absolute inset-0 border border-white/10 rounded-lg" />
@@ -404,7 +404,7 @@ export default function LandingPage() {
             <div className="bg-[#111111]/50 border border-[#222222] rounded-xl overflow-hidden backdrop-blur-sm">
               <div 
                 className="h-64 bg-cover bg-center relative"
-                style={{ backgroundImage: `url('https://images.unsplash.com/photo-1621504450181-5d356f61d307?q=80&w=800&auto=format&fit=crop')` }}
+                style={{ backgroundImage: `url('/segmentation_result_clean.jpg')` }}
               >
                 <div className="absolute inset-0 bg-black/60 mix-blend-multiply" />
                 <div className="absolute top-4 left-4 bg-[#000000]/80 backdrop-blur border border-[#FF7300]/30 px-3 py-1 rounded text-[11px] font-semibold text-[#FFA751]">
