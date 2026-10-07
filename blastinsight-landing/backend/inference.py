@@ -4,7 +4,7 @@ from ultralytics import YOLO
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "models" / "best.pt"
 
-IMGSZ = 960
+IMGSZ = 768
 CONF_RAW = 0.25
 IOU = 0.70
 MAX_DET = 1000
