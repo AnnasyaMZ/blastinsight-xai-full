@@ -16,11 +16,11 @@ from inference import model as shared_yolo_model
 # BLASTINSIGHT-XAI — EIGENCAM CONFIG
 # ============================================================
 
-MAX_RAW_DIM = 1600
+MAX_RAW_DIM = 2000
 
 # Untuk Railway, EigenCAM dibuat lebih hemat RAM
 # Segmentasi utama tetap 960 di inference.py
-CAM_IMGSZ = 320
+CAM_IMGSZ = 960
 
 # Sesuai hasil eksperimen paper:
 # Layer 16 = P3

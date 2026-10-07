@@ -145,6 +145,18 @@ export interface BlastRecord {
   confidence: number;
   backbone: string;
 
+  dss?: {
+  position?: string;
+  deviationPx?: number | null;
+
+  interpretation?: string;
+
+  operationalImpacts?: string[];
+  businessImpacts?: string[];
+
+  disclaimer?: string;
+};
+
   // =========================================================
   // METADATA / INFORMASI OPERASIONAL
   // =========================================================
